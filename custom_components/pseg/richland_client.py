@@ -123,7 +123,7 @@ def select_meter_series(series_list: list[dict[str, Any]]) -> dict[str, Any]:
 class PsegClient:
     """Client for PSE&G MySmartEnergy."""
 
-def __init__(
+    def __init__(
         self,
         cookie: str = "",
         user_configured_rate: Optional[float] = None,
@@ -212,7 +212,7 @@ def __init__(
             _LOGGER.debug("MyMeter renewed the session cookie")
             self.cookie = cookie
 
-def login(self, timeout: float = 25) -> bool:
+    def login(self, timeout: float = 25) -> bool:
         """Authenticate directly against Richland's MyMeter portal (no MFA/reCAPTCHA)."""
         if not self.username or not self.password:
             raise PsegAuthError("Username and password are required for native login")
@@ -335,30 +335,21 @@ def login(self, timeout: float = 25) -> bool:
             raise PsegAuthError("Session expired: Redirected to login")
         self._remember_renewed_cookies()
 
-    def _select_service_type(self) -> None:
-        """Make the dashboard chart show the electric service on portals that also have gas.
-
-        MyMeter answers with a redirect back to the dashboard, which is not followed.
-        The session itself is checked by the dashboard request that follows.
-        """
-        if self.service_type is None:
-            return
+    def _select_service_type(self, service_type: int) -> None:
+        """Switch the active MyMeter session service (1 = Electric, 2 = Water)."""
         try:
             resp = self.session.get(
                 f"{self.base_url}{SERVICE_TYPE_PATH}",
-                params={"ServiceType": self.service_type},
+                params={"ServiceType": service_type},
                 allow_redirects=False,
                 timeout=25,
             )
         except requests.RequestException as err:
-            raise PsegConnectionError(f"Network error selecting the service: {err}") from err
+            raise PsegConnectionError(f"Network error selecting service {service_type}: {err}") from err
         if resp.status_code >= 400:
-            # The chart then shows whichever service was selected before; the fetch goes on.
-            _LOGGER.warning(
-                "MyMeter did not accept service type %s (HTTP %s)", self.service_type, resp.status_code
-            )
+            _LOGGER.warning("MyMeter rejected service type %s (HTTP %s)", service_type, resp.status_code)
             return
-        _LOGGER.debug("Selected MyMeter service type %s (HTTP %s)", self.service_type, resp.status_code)
+        _LOGGER.debug("Selected MyMeter service type %s (HTTP %s)", service_type, resp.status_code)
 
     def _get_verification_token(self) -> str:
         """Extract __RequestVerificationToken from the /Dashboard page."""
@@ -390,7 +381,7 @@ def login(self, timeout: float = 25) -> bool:
         chunk_days: int = 90,
     ) -> list[dict[str, Any]]:
         """Fetch historical usage and cost data across a date range in polite chunks."""
-        self._select_service_type()
+        self._select_service_type(SERVICE_TYPE_ELECTRIC)
         token = self._get_verification_token()
 
         try:
@@ -507,35 +498,27 @@ def login(self, timeout: float = 25) -> bool:
         )
         return sorted_records
 
-    def fetch_service_data(
+    def _fetch_service_data_once(
         self,
         service_type: int,
         days_back: int = 14,
         rate_override: Optional[float] = None,
-        ) -> Dict[str, Any]:
-        """Fetch usage data for a specific service, auto-reauthenticating once on expiry."""
-        try:
-            return self._fetch_service_data_once(electric_rate, days_back, rate_override)
-        except PsegAuthError:
-            if not (self.username and self.password):
-                raise
-            _LOGGER.debug("Session expired; re-authenticating with Richland MyAccount")
-            self.login()
-            return self._fetch_service_data_once(water_rate, days_back, rate_override)
+    ) -> Dict[str, Any]:
+        """Execute one 3-step MyMeter chart fetch for a given service type."""
+        self._select_service_type(service_type)
+        token = self._get_verification_token()
 
         end_dt = datetime.now()
         start_dt = end_dt - timedelta(days=days_back)
-        start_str = start_dt.strftime("%Y-%m-%d")
-        end_str = end_dt.strftime("%Y-%m-%d")
 
-        chart_setup_data_kwh = {
+        chart_setup_data = {
             "__RequestVerificationToken": token,
             "UsageInterval": "5",  # 5 = Hourly
-            "UsageType": "1",  # 1 = Consumption (kWh)
+            "UsageType": "1",  # 1 = Consumption (kWh for Electric, CCF for Water)
             "jsTargetName": "StorageType",
             "EnableHoverChart": "true",
-            "Start": start_str,
-            "End": end_str,
+            "Start": start_dt.strftime("%Y-%m-%d"),
+            "End": end_dt.strftime("%Y-%m-%d"),
             "IsRangeOpen": "False",
             "MaintainMaxDate": "true",
             "SelectedViaDateRange": "False",
@@ -551,70 +534,64 @@ def login(self, timeout: float = 25) -> bool:
             "Origin": self.base_url,
         }
 
-    def fetch_all_data(self, days_back: int = 14) -> Dict[str, Any]:
-        """Fetch both Electric (kWh) and Water (CCF) data in one update cycle."""
-        return {
-            "electric": self.fetch_service_data(SERVICE_TYPE_ELECTRIC, days_back, self.user_configured_rate),
-            "water": self.fetch_service_data(SERVICE_TYPE_WATER, days_back, self.user_configured_water_rate),
-        }
-        """Fetch usage data for a specific service, auto-reauthenticating once on expiry."""
         try:
-            return self._fetch_service_data_once(electric_rate, days_back, rate_override)
-        except PsegAuthError:
-            if not (self.username and self.password):
-                raise
-            _LOGGER.debug("Session expired; re-authenticating with Richland MyAccount")
-            self.login()
-            return self._fetch_service_data_once(water_rate, days_back, rate_override)
-
-        end_dt = datetime.now()
-        start_dt = end_dt - timedelta(days=days_back)
-        start_str = start_dt.strftime("%Y-%m-%d")
-        end_str = end_dt.strftime("%Y-%m-%d")
-
-        chart_setup_data_kwh = {
-            "__RequestVerificationToken": token,
-            "UsageInterval": "5",  # 5 = Hourly
-            "UsageType": "1",  # 1 = Consumption (kWh)
-            "jsTargetName": "StorageType",
-            "EnableHoverChart": "true",
-            "Start": start_str,
-            "End": end_str,
-            "IsRangeOpen": "False",
-            "MaintainMaxDate": "true",
-            "SelectedViaDateRange": "False",
-            "ChartComparison": "1",
-            "ChartComparison2": "0",
-            "ChartComparison3": "0",
-            "ChartComparison4": "0",
-        }
-
-        headers2 = {
-            "Content-Type": "application/x-www-form-urlencoded",
-            "X-Requested-With": "XMLHttpRequest",
-            "Origin": self.base_url,
-        }
-        
-        # Step 2: Query kWh consumption data
-        try:
-            resp2 = self.session.post(f"{self.base_url}/Dashboard/Chart", data=chart_setup_data_kwh, headers=headers2, timeout=25)
+            resp2 = self.session.post(
+                f"{self.base_url}/Dashboard/Chart",
+                data=chart_setup_data,
+                headers=headers2,
+                timeout=25,
+            )
             resp2.raise_for_status()
         except requests.RequestException as err:
             raise PsegConnectionError(f"Failed to set chart context: {err}") from err
 
-        ts = int(time.time() * 1000)
         try:
-            resp3 = self.session.get(f"{self.base_url}/Dashboard/ChartData", params={"_": ts}, headers=headers2, timeout=25)
+            resp3 = self.session.get(
+                f"{self.base_url}/Dashboard/ChartData",
+                params={"_": int(time.time() * 1000)},
+                headers=headers2,
+                timeout=25,
+            )
             resp3.raise_for_status()
-            kwh_data = resp3.json()
+            chart_json = resp3.json()
         except requests.RequestException as err:
             raise PsegConnectionError(f"Failed to retrieve chart data: {err}") from err
         except json.JSONDecodeError as err:
             raise PsegConnectionError(f"Invalid JSON returned from chart data: {err}") from err
 
-        return self._parse_chart_data(kwh_data)
+        return self._parse_chart_data(chart_json, rate_override=rate_override)
 
-    def _parse_chart_data(self, data: Dict[str, Any]) -> Dict[str, Any]:
+    def fetch_service_data(
+        self,
+        service_type: int,
+        days_back: int = 14,
+        rate_override: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Fetch usage data for a specific service, auto-reauthenticating once on expiry."""
+        try:
+            return self._fetch_service_data_once(service_type, days_back, rate_override)
+        except PsegAuthError:
+            if not (self.username and self.password):
+                raise
+            _LOGGER.debug("Session expired; re-authenticating with Richland MyAccount")
+            self.login()
+            return self._fetch_service_data_once(service_type, days_back, rate_override)
+
+    def fetch_all_data(self, days_back: int = 14) -> Dict[str, Any]:
+        """Fetch both Electric (kWh) and Water (CCF) data in one update cycle."""
+        return {
+            "electric": self.fetch_service_data(
+                SERVICE_TYPE_ELECTRIC, days_back, self.user_configured_rate
+            ),
+            "water": self.fetch_service_data(
+                SERVICE_TYPE_WATER, days_back, self.user_configured_water_rate
+            ),
+        }
+        
+   
+    def _parse_chart_data(
+        self, data: Dict[str, Any], rate_override: Optional[float] = None
+    ) -> Dict[str, Any]:
         """Parse series into clean sensor model and calculate costs using effective rate."""
         chart_data = data.get("Data")
         if not chart_data or not isinstance(chart_data, dict):
@@ -673,24 +650,16 @@ def login(self, timeout: float = 25) -> bool:
 
         sorted_dates = sorted(daily_kwh_map.keys())
 
-        # Hierarchy: 1) User configured override, 2) Default rate
-        if self.user_configured_rate is not None and self.user_configured_rate > 0:
+        # Hierarchy: 1) Passed rate_override, 2) User configured electric rate, 3) Default rate
+        if rate_override is not None and rate_override > 0:
+            effective_rate = rate_override
+            rate_source = "user_configured"
+        elif self.user_configured_rate is not None and self.user_configured_rate > 0:
             effective_rate = self.user_configured_rate
             rate_source = "user_configured"
         else:
             effective_rate = DEFAULT_ELECTRIC_RATE
             rate_source = "default"
-
-        self.effective_rate = effective_rate
-        self.rate_source = rate_source
-        self.rate_7d_avg = None
-        self.days_used_for_rate = 0
-
-        _LOGGER.debug(
-            "PSE&G Rate Resolved: %s $/kWh (source=%s)",
-            effective_rate,
-            rate_source,
-        )
 
         # Build final hourly records with calculated cost
         hourly_records = []
